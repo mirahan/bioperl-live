@@ -109,14 +109,18 @@ sub _initialize
     }
   }
   elsif ($self->mode eq 'w') {
+    $self->_flush_on_write(1);
     # print default lines
     $self->_print('<?xml version="1.0" encoding="UTF-8"?>',"\n");
     $self->_print('<phyloxml xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://www.phyloxml.org" xsi:schemaLocation="http://www.phyloxml.org http://www.phyloxml.org/1.10/phyloxml.xsd">');
+    $self->_print("\n");
   }
 
+  $self->{'_schemalocation'} = 'http://www.phyloxml.org/1.10/phyloxml.xsd';
   $self->treetype($args{-treetype});
   $self->nodetype($args{-nodetype});
   $self->{'_lastitem'} = {}; # holds open items and the attribute hash
+  $self->{'_xs_sequence_order'} = {}; # holds the xs:sequence order of elements based on xsd
   $self->_init_func();
 }
 
@@ -139,14 +143,53 @@ sub _init_func
   $self->{'_end_elements'} = \%end_elements;
 }
 
+sub _xs_sequence_order
+{
+  my ($self) = @_;
+  if ((keys %{$self->{'_xs_sequence_order'}}) == 0) 
+  {
+    my $schemaloc = $self->{'_schemalocation'};
+    my $schemaparser = XML::LibXML->new;
+    my $schemadoc    = $schemaparser->load_xml(location => "$schemaloc");
+    if (!$schemadoc) {
+      $self->throw("Failed to create schema from $schemaloc \n");
+    }
+    my $schemaroot = $schemadoc->documentElement();
+    my $xc = XML::LibXML::XPathContext->new($schemaroot);
+    $xc->registerNs('xs', 'http://www.w3.org/2001/XMLSchema');
+    my @seqnodes = $xc->findnodes('//xs:sequence');
+
+    foreach my $seq (@seqnodes) {
+      my ($ctname) = $seq->parentNode->getAttribute('name');
+      $ctname = lc($ctname);
+      my @seqelements = $xc->findnodes('xs:element', $seq);
+      my @seqorder = ();
+      foreach my $e (@seqelements) {
+        my ($ename) = $e->getAttribute('name');
+        push (@seqorder, lc($ename));
+      }   
+      $self->{'_xs_sequence_order'}->{$ctname} = \@seqorder;
+    }
+  }
+  return $self->{'_xs_sequence_order'};
+}
+
+
 sub DESTROY {
   my $self = shift;
-  if ($self->mode eq 'w') {
-    $self->_print('</phyloxml>');
-    $self->flush if $self->_flush_on_write && defined $self->_fh;
-  }
-  $self->SUPER::DESTROY;
+  $self->NEXT::DESTROY;
 }
+
+sub close {
+  my $self = shift;
+  if ( defined $self->_fh && $self->mode eq 'w') {
+    $self->_print("</phyloxml>");
+    $self->_print("\n");
+    $self->flush() if $self->_flush_on_write && defined $self->_fh;
+  }
+  $self->SUPER::close;
+}
+
 
 =head2 next_tree
 
@@ -283,7 +326,7 @@ sub add_phyloXML_annotation
   my ($self, @args) = @_;
   my ($obj, $xml_string) = $self->_rearrange([qw(OBJ XML)], @args);
   
-  $xml_string = '<phyloxml>'.$xml_string.'</phyloxml>';
+  $xml_string = "<phyloxml>".$xml_string."</phyloxml>\n";
   $self->debug( $xml_string );
 
   my $oldreader = $self->{'_reader'};   # save reader
@@ -332,17 +375,13 @@ sub add_phyloXML_annotation
 sub write_tree
 {
   my ($self, @trees) = @_;
+  my $sequenceorderhash = $self->_xs_sequence_order();
+
   foreach my $tree (@trees) {
     my $root = $tree->get_root_node;
     $self->_print("<phylogeny");
-    my @tags = $tree->get_all_tags();
+    
     my $attr_str = '';
-    foreach my $tag (@tags) {
-      my @values = $tree->get_tag_values($tag);
-      foreach (@values) {
-        $attr_str .= " ".$tag."=\"".$_."\"";
-      }
-    }
     # check if rooted
     my ($b_rooted) = $tree->get_tag_values('rooted');
     if ($b_rooted) {
@@ -356,8 +395,10 @@ sub write_tree
         $attr_str .= " rooted=\"false\"";
       }
     }
+
+    # print clades (nodes)
     $self->_print($attr_str); 
-    $self->_print(">");
+    $self->_print(">\n");
     if ($root->isa('Bio::Tree::AnnotatableNode')) {
       $self->_print($self->_write_tree_Helper_annotatableNode($root));
     }
@@ -373,9 +414,21 @@ sub write_tree
     while (my $str = pop (@{$self->{'_tree_attr'}->{'sequence_relation'}})) {
       $self->_print($str);
     }
-    $self->_print("</phylogeny>");
+    # print properties
+    my @tags = $tree->get_all_tags();
+    foreach my $tag (@tags) {
+      if ($tag eq 'rooted') {next;}
+      my @values = $tree->get_tag_values($tag);
+      foreach my $val (@values) {
+        $self->_print("<property datatype=\"xsd:string\" ref=\"tag:$tag\" applies_to=\"phylogeny\"> ");
+        $self->_print($val);
+        $self->_print(" </property>\n");
+      }
+    }
+ 
+    $self->_print("</phylogeny>\n");
   }
-  $self->flush if $self->_flush_on_write && defined $self->_fh;
+  $self->flush() if $self->_flush_on_write && defined $self->_fh;
   return;
 }
 
@@ -392,7 +445,7 @@ sub write_tree
 
 sub _write_tree_Helper_annotatableNode
 {
-  my ($self, $node, $str) = @_;     # this self is a Bio::Tree::phyloxml
+  my ($self, $node, $str, $level) = @_;     # this self is a Bio::Tree::phyloxml
   
   my $ac = $node->annotation;
 
@@ -405,7 +458,7 @@ sub _write_tree_Helper_annotatableNode
   }
 
   # start <clade>
-  $str .= '<clade';
+  $str .= "\t"x$level.'<clade';
   my ($attr) = $ac->get_Annotations('_attr'); # check id_source
     if ($attr) { 
       my ($id_source) = $attr->get_Annotations('id_source');
@@ -413,31 +466,18 @@ sub _write_tree_Helper_annotatableNode
         $str .= " id_source=\"".$id_source->value."\"";
       }
     }
-  $str .= ">";
+  $str .= ">\n";
+
+  # print all annotations
+  my $sequenceorder = $self->{'_xs_sequence_order'}->{'clade'};
+  $str = $self->_print_ordered_annotation( $node, $str, $level+1, $ac, $sequenceorder );
 
   # print all descendent nodes
   foreach my $child ( $node->each_Descendent() ) {
-    $str = $self->_write_tree_Helper_annotatableNode($child, $str);
+    $str = $self->_write_tree_Helper_annotatableNode($child, $str, $level+1);
   }
 
-  # print all annotations
-  $str = print_annotation( $node, $str, $ac );
-
-  # print all sequences
-  if ($node->has_sequence) {
-    foreach my $seq (@{$node->sequence}) {
-      # if sequence_relation exists
-      my @relations = $seq->annotation->get_Annotations('sequence_relation');
-      foreach (@relations) {
-        my $sequence_rel = $self->_relation_to_string($seq, $_, '');
-        # set as tree attr
-        push (@{$self->{'_tree_attr'}->{'sequence_relation'}}, $sequence_rel);
-      }
-      $str = print_seq_annotation( $node, $str, $seq );
-    }
-  }
-
-  $str .= "</clade>";
+  $str .= "\t"x$level."</clade>\n";
 
   return $str;
 }
@@ -460,9 +500,21 @@ sub _write_tree_Helper_generic
   # start <clade>
   $str .= '<clade>';
 
-  # print all descendent nodes
-  foreach my $child ( $node->each_Descendent() ) {
-    $str = $self->_write_tree_Helper_generic($child, $str);
+  # print NodeI features
+  if ($node->id) {
+    $str .= "<name>";
+    $str .= $node->id;
+    $str .= "</name>\n";
+  }
+  if ($node->branch_length) {
+    $str .= "<branch_length>";
+    $str .= $node->branch_length;
+    $str .= "</branch_length>\n";
+  }
+  if ($node->bootstrap) {
+    $str .= "<confidence type = \"bootstrap\">";
+    $str .= $node->bootstrap;
+    $str .= "</confidence>\n";
   }
 
   # print all tags
@@ -476,24 +528,12 @@ sub _write_tree_Helper_generic
     }
   }
 
-  # print NodeI features
-  if ($node->id) {
-    $str .= "<name>";
-    $str .= $node->id;
-    $str .= "</name>";
-  }
-  if ($node->branch_length) {
-    $str .= "<branch_length>";
-    $str .= $node->branch_length;
-    $str .= "</branch_length>";
-  }
-  if ($node->bootstrap) {
-    $str .= "<confidence type = \"bootstrap\">";
-    $str .= $node->bootstrap;
-    $str .= "</confidence>";
+  # print all descendent nodes
+  foreach my $child ( $node->each_Descendent() ) {
+    $str = $self->_write_tree_Helper_generic($child, $str);
   }
 
-  $str .= "</clade>";
+  $str .= "</clade>\n";
   return $str;
 }
 
@@ -546,10 +586,10 @@ sub _relation_to_string {
     $str .= "</confidence>";
     $str .= "</";
     $str .= $rel->tagname;
-    $str .= ">";
+    $str .= ">\n";
   }
   else {
-    $str .= "/>";
+    $str .= "/>\n";
   }
   return $str;
 }
@@ -1324,43 +1364,58 @@ sub node_to_string
   $str .= '>';
 
   # print all annotations
-  $str = print_annotation( $self, $str, $ac );
-  # print all sequences
-  if ($self->has_sequence) {
-    foreach my $seq (@{$self->sequence}) {
-      $str = print_seq_annotation( $self, $str, $seq );
-    }
-  }
+  my $phyloxmlIO = Bio::TreeIO->new(
+       -format => 'phyloxml',
+       -file   => '>/dev/null'); 
+  my $sequenceorder = $self->{'_xs_sequence_order'}->{'clade'};
+  $str = _print_ordered_annotation( $phyloxmlIO, $self, $str, 0, $ac, $sequenceorder );
   
   $str .= '</clade>';
   return $str;
 }
 
-=head2 print_annotation
 
- Title   : print_annotation
- Usage   : $str = $annotatablenode->print_annotation($str, $annotationcollection)
- Function: prints the annotationCollection in a phyloXML format.
- Returns : string of annotation information
- Args    : string to which the Annotation should be concatenated to,
-           annotationCollection that holds the Annotations
-
-=cut
-
-# Again, it may be more appropriate to make a separate Annotation::phyloXML object
-# and have this subroutine within that object so it can handle the 
-# reading and writing of the values and attributes.
-# especially since this function is used both by 
+# this function is used both by 
 # Bio::TreeIO::phyloxml (through write_tree) and 
 # Bio::Node::AnnotatableNode (through node_to_string).
-# but since tagTree is a temporary stub and I didn't want to make 
-# a redundant object I've put it here for now.
 
-sub print_annotation 
+sub _print_ordered_annotation
 {
-  my ($self, $str, $ac) = @_; 
- 
-  my @all_anns = $ac->get_Annotations();
+  my ($self, $node, $str, $level, $ac, $elementorder) = @_; 
+  foreach my $e (@$elementorder) {
+    if ($e eq 'sequence') {
+      # print all sequences
+      if ($node->has_sequence) {
+        foreach my $seq (@{$node->sequence}) {
+          # if sequence_relation exists
+          my @relations = $seq->annotation->get_Annotations('sequence_relation');
+          foreach (@relations) {
+            my $sequence_rel = $self->_relation_to_string($seq, $_, '');
+            # set as tree attr
+            push (@{$self->{'_tree_attr'}->{'sequence_relation'}}, $sequence_rel);
+          }
+          $str = $self->_print_seq_annotation( $node, $seq, $str, $level, $e);
+        }
+      }
+    }
+    else {
+      $str = $self->_print_annotation($node, $str, $level, $ac, $e); 
+    }
+  }
+  return $str;
+}
+
+sub _print_annotation 
+{
+  my ($self, $node, $str, $level, $ac, $e) = @_; 
+  my @all_anns = ();
+  if ($e) {
+    @all_anns = $ac->get_Annotations($e);
+  }
+  else {
+    @all_anns = $ac->get_Annotations();
+  }
+
   foreach my $ann (@all_anns) {
     my $key = $ann->tagname;
     if ($key eq '_attr') { next; } # attributes are already printed in the previous level 
@@ -1370,52 +1425,46 @@ sub print_annotation
         $str .= $ann->value;
       }
       else {
-        $str .= "<$key>";
+        $str .= "\t"x$level."<$key>";
         $str .= $ann->value;
-        $str .= "</$key>";
+        $str .= "</$key>\n";
       }
     }
     elsif ($ann->isa('Bio::Annotation::Collection')) 
     {
       my @attrs = $ann->get_Annotations('_attr');
       if (@attrs) {   # if there is a attribute collection
-        $str .= "<$key";
-        $str = print_attr($self, $str, $attrs[0]);
+        $str .= "\t"x$level."<$key";
+        $str = _print_attr($self, $str, $attrs[0]);
         $str .= ">";
       }
       else {
-        $str .= "<$key>";
+        $str .= "\t"x$level."<$key>";
       }
-      $str = print_annotation($self, $str, $ann);
-      $str .= "</$key>";
+      my $sequenceorder = $self->{'_xs_sequence_order'}->{lc($key)};
+      if ($sequenceorder) {
+        $str .= "\n";
+        $str = $self->_print_ordered_annotation($node, $str, $level+1, $ann, $sequenceorder);
+        $str .= "\t"x$level;
+      }
+      else {
+        $str = $self->_print_annotation($node, $str, $level+1, $ann);
+      }
+      $str .= "</$key>\n";
     }
-  } 
+  }
   return $str;
 }
 
-=head2 print_attr
-
- Title   : print_attr
- Usage   : $str = $annotatablenode->print_attr($str, $annotationcollection)
- Function: prints the annotationCollection in a phyloXML format.
- Returns : string of attributes
- Args    : string to which the Annotation should be concatenated to,
-           AnnotationCollection that holds the attributes
-
-=cut
-
-# Again, it may be more appropriate to make a separate Annotation::phyloXML object
-# and have this subroutine within that object so it can handle the 
-# reading and writing of the values and attributes.
-# especially since this function is used both by 
+# this function is used both by 
 # Bio::TreeIO::phyloxml and Bio::Node::AnnotatableNode 
-# (through print_annotation).
+# (through _print_annotation).
 # but since tagTree is a temporary stub and I didn't want to make 
 # a redundant object I've put it here for now.
 
-sub print_attr
+sub _print_attr
 {
-  my ($self, $str, $ac) = @_; 
+  my ($self,  $str, $ac) = @_; 
   my @all_attrs = $ac->get_Annotations();
   foreach my $attr (@all_attrs) {
     if  (!$attr->isa('Bio::Annotation::SimpleValue')) {
@@ -1429,80 +1478,44 @@ sub print_attr
   return $str;
 } 
 
-=head2 print_sequence_annotation
 
- Title   : print_sequence_annotation
- Usage   : $str = $node->print_seq_annotation( $str, $seq );
- Function: prints the Bio::Seq object associated with the node 
-           in a phyloXML format.
- Returns : string that describes the sequence
- Args    : string to which the Annotation should be concatenated to,
-           Seq object to print in phyloXML
-
-=cut
-
-# Again, it may be more appropriate to make a separate Annotation::phyloXML object
-# and have this subroutine within that object so it can handle the 
-# reading and writing of the values and attributes.
-# especially since this function is used both by 
+# this function is used both by 
 # Bio::TreeIO::phyloxml (through write_tree) and 
 # Bio::Node::AnnotatableNode (through node_to_string).
-# but since tagTree is a temporary stub and I didn't want to make 
-# a redundant object I've put it here for now.
 
 
-sub print_seq_annotation 
+sub _print_seq_annotation 
 {
-  my ($self, $str, $seq) = @_; 
-  
-  $str .= "<sequence";
+  my ($self, $node, $seq, $str, $level, $e) = @_; 
+
+  $str .= "\t"x$level."<sequence";
   my ($attr) = $seq->annotation->get_Annotations('_attr'); # check id_source
-  if ($attr) { 
-    my ($id_source) = $attr->get_Annotations('id_source');
-    if ($id_source) {
-      $str .= " id_source=\"".$id_source->value."\"";
+    if ($attr) { 
+      my ($id_source) = $attr->get_Annotations('id_source');
+      if ($id_source) {
+        $str .= " id_source=\"".$id_source->value."\"";
+      }
     }
-  }
   $str .= ">";
+  $str .= "\n";
 
-  my @all_anns = $seq->annotation->get_Annotations();
-  foreach my $ann (@all_anns) {
-    my $key = $ann->tagname;
-    if ($key eq '_attr') { next; } # attributes are already printed in the previous level 
-    if  ($ann->isa('Bio::Annotation::SimpleValue')) 
-    {
-      if ($key eq '_text') {
-        $str .= $ann->value;
-      }
-      else {
-        $str .= "<$key>";
-        $str .= $ann->value;
-        $str .= "</$key>";
+  my $sequenceorder = $self->{'_xs_sequence_order'}->{'sequence'};
+  foreach my $e (@$sequenceorder) {
+    if ($e eq 'mol_seq') {
+      if ($seq->seq()) {
+        $str .= "\t"x$level;
+        $str .= "<mol_seq>";
+        $str .= $seq->seq();
+        $str .= "</mol_seq>\n";
       }
     }
-    elsif ($ann->isa('Bio::Annotation::Collection')) 
-    {
-      my @attrs = $ann->get_Annotations('_attr');
-      if (@attrs) {   # if there is a attribute collection
-        $str .= "<$key";
-        $str = print_attr($self, $str, $attrs[0]);
-        $str .= ">";
-      }
-      else {
-        $str .= "<$key>";
-      }
-      $str = print_annotation($self, $str, $ann);
-      $str .= "</$key>";
-    }
+    else {
+      $str = $self->_print_annotation($node, $str, $level+1, $seq->annotation, $e); 
+    } 
   }
-  # print mol_seq 
-  if ($seq->seq()) {
-    $str .= "<mol_seq>";
-    $str .= $seq->seq();
-    $str .= "</mol_seq>";
-  }
+  $str .= "\t"x$level;
 
-  $str .= "</sequence>";
+  $str .= "</sequence>\n";
   return $str;
 }
 
